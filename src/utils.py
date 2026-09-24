@@ -1,284 +1,289 @@
+"""Shared data loading, encoding, and checkpoint helpers for training/eval scripts."""
 
-from argparse import Namespace
-from collections import OrderedDict
-from dataclasses import dataclass
-from functools import partial
+from __future__ import annotations
+
+import argparse
 import json
 from pathlib import Path
-import random
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any
 
-from omegaconf import OmegaConf
 import numpy as np
 import torch
-import torch.distributed as dist
-from torch import Tensor
-from torch.optim.lr_scheduler import LambdaLR
-import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim import AdamW
-import wandb
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+
+from mask_utils import build_mask_from_fullres
+from models.cnn_encoder import CNNEncoder
+from models.latent_world_model import LatentWorldModel
+from models.ttc_predictor import TTCPredictor
 
 
-Logs = List[Dict[str, float]]
-LossAndLogs = Tuple[Tensor, Dict[str, Any]]
+def hwc_to_chw(frame: np.ndarray) -> torch.Tensor:
+    return torch.from_numpy(frame).permute(2, 0, 1).contiguous()
 
 
-class StateDictMixin:
-    def _init_fields(self) -> None:
-        def has_sd(x: str) -> bool:
-            return callable(getattr(x, "state_dict", None)) and callable(getattr(x, "load_state_dict", None))
-
-        self._all_fields = {k for k in vars(self) if not k.startswith("_")}
-        self._fields_sd = {k for k in self._all_fields if has_sd(getattr(self, k))}
-
-    def _get_field(self, k: str) -> Any:
-        return getattr(self, k).state_dict() if k in self._fields_sd else getattr(self, k)
-
-    def _set_field(self, k: str, v: Any) -> None:
-        getattr(self, k).load_state_dict(v) if k in self._fields_sd else setattr(self, k, v)
-
-    def state_dict(self) -> Dict[str, Any]:
-        if not hasattr(self, "_all_fields"):
-            self._init_fields()
-        return {k: self._get_field(k) for k in self._all_fields}
-
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        if not hasattr(self, "_all_fields"):
-            self._init_fields()
-        assert set(list(state_dict.keys())) == self._all_fields
-        for k, v in state_dict.items():
-            self._set_field(k, v)
+def resize_chw(
+    image: torch.Tensor,
+    out_h: int,
+    out_w: int,
+    mode: str = "bicubic",
+) -> torch.Tensor:
+    x = image.unsqueeze(0).float()
+    kwargs = {"mode": mode, "align_corners": False}
+    if mode in ("bilinear", "bicubic"):
+        kwargs["antialias"] = True
+    x = F.interpolate(x, size=(out_h, out_w), **kwargs)
+    return x.squeeze(0).round().clamp(0, 255).to(torch.uint8)
 
 
-@dataclass
-class CommonTools(StateDictMixin):
-    denoiser: Any
-    upsampler: Optional[Any] = None
-
-    def get(self, name: str) -> Any:
-        return getattr(self, name)
-
-    def set(self, name: str, value: Any):
-        return setattr(self, name, value)
+def load_visuals_paths(data_dir: Path, split: str) -> list[Path]:
+    paths = sorted((data_dir / split).glob("*_visuals.npz"))
+    if not paths:
+        raise FileNotFoundError(f"No *_visuals.npz files in {data_dir / split}")
+    return paths
 
 
-def broadcast_if_needed(*args):
-    objects = list(args)
-    if dist.is_initialized():
-        dist.broadcast_object_list(objects, src=0) 
-        # the list `objects` now contains the version of rank 0
-    return objects
+def visuals_path_to_data_path(visuals_path: Path) -> Path:
+    return visuals_path.with_name(visuals_path.name.replace("_visuals.npz", "_data.csv"))
 
 
-def build_ddp_wrapper(**modules_dict: Dict[str, nn.Module]) -> Namespace:
-    return Namespace(**{name: DDP(module) for name, module in modules_dict.items()})
+def load_episode_tabular(
+    data_path: Path,
+    max_frames: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Actions and obs_ttc aligned 1:1 with frames; each shape (T,)."""
+    import pandas as pd
+
+    df = pd.read_csv(data_path)
+    if max_frames is not None:
+        df = df.iloc[:max_frames]
+    actions = torch.tensor(df["action"].to_numpy(), dtype=torch.long)
+    ttc = torch.tensor(df["obs_ttc"].to_numpy(), dtype=torch.float32)
+    return actions, ttc
 
 
-def compute_classification_metrics(confusion_matrix: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-    num_classes = confusion_matrix.size(0)
-    precision = torch.zeros(num_classes)
-    recall = torch.zeros(num_classes)
-    f1_score = torch.zeros(num_classes)
+class EpisodeDataset(Dataset):
+    """Full episodes as variable-length frame sequences."""
 
-    for i in range(num_classes):
-        true_positive = confusion_matrix[i, i].item()
-        false_positive = confusion_matrix[:, i].sum().item() - true_positive
-        false_negative = confusion_matrix[i, :].sum().item() - true_positive
+    def __init__(
+        self,
+        data_dir: Path,
+        split: str,
+        out_h: int,
+        out_w: int,
+        interp_mode: str = "bicubic",
+        max_episodes: int | None = None,
+        max_frames: int | None = None,
+        min_frames: int = 2,
+    ):
+        self.out_h = out_h
+        self.out_w = out_w
+        self.interp_mode = interp_mode
+        self.max_frames = max_frames
+        self.min_frames = min_frames
+        self.paths: list[Path] = []
+        self.episode_lengths: list[int] = []
 
-        precision[i] = true_positive / (true_positive + false_positive) if (true_positive + false_positive) != 0 else 0
-        recall[i] = true_positive / (true_positive + false_negative) if (true_positive + false_negative) != 0 else 0
-        f1_score[i] = (
-            2 * (precision[i] * recall[i]) / (precision[i] + recall[i]) if (precision[i] + recall[i]) != 0 else 0
+        paths = load_visuals_paths(data_dir, split)
+        if max_episodes is not None:
+            paths = paths[:max_episodes]
+
+        for path in paths:
+            with np.load(path) as data:
+                num_frames = data["visuals"].shape[0]
+            usable = num_frames
+            if max_frames is not None:
+                usable = min(usable, max_frames)
+            if usable >= min_frames:
+                self.paths.append(path)
+                self.episode_lengths.append(usable)
+
+        if not self.paths:
+            raise ValueError(f"No episodes with >= {min_frames} frames found for split={split!r}")
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        path = self.paths[idx]
+        with np.load(path) as data:
+            visuals = data["visuals"]
+
+        frames = []
+        for frame_idx in range(visuals.shape[0]):
+            chw = hwc_to_chw(visuals[frame_idx])
+            frames.append(resize_chw(chw, self.out_h, self.out_w, mode=self.interp_mode))
+            if self.max_frames is not None and len(frames) >= self.max_frames:
+                break
+
+        actions, ttc = load_episode_tabular(
+            visuals_path_to_data_path(path),
+            max_frames=self.max_frames,
         )
-
-    return precision, recall, f1_score
-
-
-def configure_opt(model: nn.Module, lr: float, weight_decay: float, eps: float, *blacklist_module_names: str) -> AdamW:
-    """Credits to https://github.com/karpathy/minGPT"""
-    # separate out all parameters to those that will and won't experience regularizing weight decay
-    decay = set()
-    no_decay = set()
-    whitelist_weight_modules = (nn.Linear, nn.Conv1d, nn.Conv2d, nn.LSTMCell, nn.LSTM)
-    blacklist_weight_modules = (nn.LayerNorm, nn.Embedding, nn.GroupNorm)
-    for mn, m in model.named_modules():
-        for pn, p in m.named_parameters():
-            fpn = "%s.%s" % (mn, pn) if mn else pn  # full param name
-            if any([fpn.startswith(module_name) for module_name in blacklist_module_names]):
-                no_decay.add(fpn)
-            elif "bias" in pn:
-                # all biases will not be decayed
-                no_decay.add(fpn)
-            elif (pn.endswith("weight") or pn.startswith("weight_")) and isinstance(m, whitelist_weight_modules):
-                # weights of whitelist modules will be weight decayed
-                decay.add(fpn)
-            elif (pn.endswith("weight") or pn.startswith("weight_")) and isinstance(m, blacklist_weight_modules):
-                # weights of blacklist modules will NOT be weight decayed
-                no_decay.add(fpn)
-
-    # validate that we considered every parameter
-    param_dict = {pn: p for pn, p in model.named_parameters()}
-    inter_params = decay & no_decay
-    union_params = decay | no_decay
-    assert len(inter_params) == 0, f"parameters {str(inter_params)} made it into both decay/no_decay sets!"
-    assert (
-        len(param_dict.keys() - union_params) == 0
-    ), f"parameters {str(param_dict.keys() - union_params)} were not separated into either decay/no_decay set!"
-
-    # create the pytorch optimizer object
-    optim_groups = [
-        {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": weight_decay},
-        {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
-    ]
-    optimizer = AdamW(optim_groups, lr=lr, eps=eps)
-    return optimizer
-
-
-def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters())
-
-
-def extract_state_dict(state_dict: OrderedDict, module_name: str) -> OrderedDict:
-    return OrderedDict({k.split(".", 1)[1]: v for k, v in state_dict.items() if k.startswith(module_name)})
-
-
-def get_lr_sched(opt: torch.optim.Optimizer, num_warmup_steps: int) -> LambdaLR:
-    def lr_lambda(current_step: int):
-        return 1 if current_step >= num_warmup_steps else current_step / max(1, num_warmup_steps)
-
-    return LambdaLR(opt, lr_lambda, last_epoch=-1)
-
-
-def init_lstm(model: nn.Module) -> None:
-    for name, p in model.named_parameters():
-        if "weight_ih" in name:
-            nn.init.xavier_uniform_(p.data)
-        elif "weight_hh" in name:
-            nn.init.orthogonal_(p.data)
-        elif "bias_ih" in name:
-            p.data.fill_(0)
-            # Set forget-gate bias to 1
-            n = p.size(0)
-            p.data[(n // 4) : (n // 2)].fill_(1)
-        elif "bias_hh" in name:
-            p.data.fill_(0)
-
-
-def get_path_agent_ckpt(path_ckpt_dir: Union[str, Path], epoch: int, num_zeros: int = 5) -> Path:
-    d = Path(path_ckpt_dir) / "agent_versions"
-    if epoch >= 0:
-        return d / f"agent_epoch_{epoch:0{num_zeros}d}.pt"
-    else:
-        all_ = sorted(list(d.iterdir()))
-        assert len(all_) >= -epoch
-        return all_[epoch]
-
-
-def keep_agent_copies_every(
-    agent_sd: Dict[str, Any],
-    epoch: int,
-    path_ckpt_dir: Path,
-    every: int,
-    num_to_keep: Optional[int],
-) -> None:
-    assert every > 0
-    assert num_to_keep is None or num_to_keep > 0
-    get_path = partial(get_path_agent_ckpt, path_ckpt_dir)
-    get_path(0).parent.mkdir(parents=False, exist_ok=True)
-
-    # Save agent
-    save_with_backup(agent_sd, get_path(epoch))
-
-    # Clean oldest
-    if (num_to_keep is not None) and (epoch % every == 0):
-        get_path(max(0, epoch - num_to_keep * every)).unlink(missing_ok=True)
-
-    # Clean previous
-    if (epoch - 1) % every != 0:
-        get_path(max(0, epoch - 1)).unlink(missing_ok=True)
-
-
-def move_opt_to(opt: AdamW, device: torch.device):
-    for optimizer_metrics in opt.state.values():
-        for metric_name, metric in optimizer_metrics.items():
-            if torch.is_tensor(metric) and metric_name != "step":
-                optimizer_metrics[metric_name] = metric.to(device)
-
-
-def process_confusion_matrices_if_any_and_compute_classification_metrics(logs: Logs) -> None:
-    cm = [x.pop("confusion_matrix") for x in logs if "confusion_matrix" in x]
-    if len(cm) > 0:
-        confusion_matrices = {k: sum([d[k] for d in cm]) for k in cm[0]}  # accumulate confusion matrices
-        metrics = {}
-        for key, confusion_matrix in confusion_matrices.items():
-            precision, recall, f1_score = compute_classification_metrics(confusion_matrix)
-            metrics.update(
-                {
-                    **{f"classification_metrics/{key}_precision_class_{i}": v for i, v in enumerate(precision)},
-                    **{f"classification_metrics/{key}_recall_class_{i}": v for i, v in enumerate(recall)},
-                    **{f"classification_metrics/{key}_f1_score_class_{i}": v for i, v in enumerate(f1_score)},
-                }
+        if actions.shape[0] != len(frames) or ttc.shape[0] != len(frames):
+            raise ValueError(
+                f"Tabular/frame length mismatch for {path.name}: "
+                f"{actions.shape[0]} actions, {ttc.shape[0]} ttc vs {len(frames)} frames"
             )
+        return torch.stack(frames), actions, ttc
 
-        logs.append(metrics)  # Append the obtained metrics to logs (in place)
+
+def collate_episodes(
+    batch: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stack equal-length episodes: frames (B, T, C, H, W), actions (B, T), ttc (B, T), lengths (B,)."""
+    frames = torch.stack([sample[0] for sample in batch], dim=0)
+    actions = torch.stack([sample[1] for sample in batch], dim=0)
+    ttc = torch.stack([sample[2] for sample in batch], dim=0)
+    lengths = torch.full((len(batch),), frames.shape[1], dtype=torch.long)
+    return frames, actions, ttc, lengths
 
 
-def prompt_run_name(game):
-    cfg_file = Path("config/trainer.yaml")
-    cfg_name = OmegaConf.load(cfg_file).wandb.name
-    suffix = f"-{cfg_name}" if cfg_name is not None else ""
-    name = game + suffix
-    name_ = input(f"Confirm run name by pressing Enter (or enter a new name): {name}\n")
-    if name_ != "":
-        name = name_
+def flatten_valid_frames(frames: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """(B, T, C, H, W) -> (N, C, H, W) using per-episode lengths."""
+    chunks = [frames[i, : int(length)] for i, length in enumerate(lengths.tolist())]
+    return torch.cat(chunks, dim=0)
+
+
+def encode_episode_frames(
+    encoder: CNNEncoder,
+    frames: torch.Tensor,
+    lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Encode each frame with the (trainable) CNN encoder -> (B, T, D)."""
+    b, t, _, _, _ = frames.shape
+    d = encoder.embed_dim * encoder.grid_h * encoder.grid_w
+    latents = torch.zeros(b, t, d, device=frames.device, dtype=torch.float32)
+    for frame_idx in range(int(lengths.max().item())):
+        z = encoder.encode_spatial(frames[:, frame_idx]).flatten(1)
+        latents[:, frame_idx] = z
+    return latents
+
+
+def build_encoder(image_size: tuple[int, int], device: torch.device) -> CNNEncoder:
+    return CNNEncoder(image_size=image_size, input_uint8=True).to(device)
+
+
+def load_encoder_checkpoint(
+    encoder: CNNEncoder,
+    checkpoint_path: Path | None,
+    device: torch.device,
+) -> None:
+    if checkpoint_path is None or not checkpoint_path.exists():
+        return
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if "encoder" in ckpt:
+        try:
+            encoder.load_state_dict(ckpt["encoder"])
+        except RuntimeError:
+            encoder.encoder.load_state_dict(ckpt["encoder"])
+    elif "model" in ckpt:
+        encoder.load_state_dict(ckpt["model"])
+    else:
+        raise KeyError(f"No encoder/model weights in {checkpoint_path}")
+
+
+def load_training_checkpoint(
+    checkpoint_path: Path,
+    encoder: CNNEncoder,
+    world_model: LatentWorldModel,
+    device: torch.device,
+    ttc_predictor: TTCPredictor | None = None,
+) -> dict:
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if "encoder" in ckpt:
+        encoder.load_state_dict(ckpt["encoder"])
+    if "world_model" in ckpt:
+        world_model.load_state_dict(ckpt["world_model"])
+    elif "model" in ckpt:
+        world_model.load_state_dict(ckpt["model"])
+    if ttc_predictor is not None and "ttc_predictor" in ckpt:
+        ttc_predictor.load_state_dict(ckpt["ttc_predictor"])
+    return ckpt
+
+
+def next_step_mask(lengths: torch.Tensor, pred_steps: int, device: torch.device) -> torch.Tensor:
+    """Valid next-step mask; shape (B, pred_steps)."""
+    mask = torch.zeros(len(lengths), pred_steps, device=device)
+    for i, length in enumerate(lengths.tolist()):
+        valid = max(int(length) - 1, 0)
+        if valid > 0:
+            mask[i, :valid] = 1.0
+    return mask
+
+
+def pixel_weight_map(frames: torch.Tensor, gain: float) -> torch.Tensor:
+    """Per-pixel loss weights 1 + gain*mask from uint8 frames (B, T, C, H, W) -> (B, T, 1, H, W)."""
+    b, t, c, h, w = frames.shape
+    flat = frames.reshape(b * t, c, h, w).float()
+    mask = build_mask_from_fullres(flat / 127.5 - 1.0, h, w)
+    return 1.0 + gain * mask.reshape(b, t, 1, h, w)
+
+
+def save_training_checkpoint(
+    path: Path,
+    encoder: CNNEncoder,
+    world_model: LatentWorldModel,
+    ttc_predictor: TTCPredictor,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    args: argparse.Namespace,
+    phase: str | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "epoch": epoch,
+        "encoder": encoder.state_dict(),
+        "world_model": world_model.state_dict(),
+        "ttc_predictor": ttc_predictor.state_dict(),
+        "model": world_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "args": vars(args),
+    }
+    if phase is not None:
+        payload["phase"] = phase
+    torch.save(payload, path)
+
+
+def save_training_log(path: Path, args: argparse.Namespace, history: list | dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    args_dict = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+    if isinstance(history, list):
+        payload: dict[str, Any] = {"args": args_dict, "epochs": history}
+    else:
+        payload = {"args": args_dict, **history}
+    with path.open("w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def format_param(value: float) -> str:
+    text = f"{value:g}" if float(value).is_integer() else f"{value:.4g}"
+    return text.replace(".", "p").replace("-", "m")
+
+
+def run_output_name(args: argparse.Namespace, *, include_c: bool = True) -> str:
+    """Directory name for this run, derived from key hyperparameters."""
+    if args.run_name is not None:
+        return args.run_name
+    name = f"a{format_param(args.loss_a)}_b{format_param(args.loss_b)}"
+    if include_c:
+        name += f"_c{format_param(args.loss_c)}"
+    if getattr(args, "pixel_mask_gain", 0.0) > 0.0:
+        name += f"_m{format_param(args.pixel_mask_gain)}"
     return name
 
 
-def save_info_for_import_script(epoch: int, run_name: str, path_ckpt_dir: Path) -> None:
-    with (path_ckpt_dir / "info_for_import_script.json").open("w") as f:
-        json.dump({"epoch": epoch, "name": run_name}, f)
-
-
-def save_with_backup(obj: Any, path: Path):
-    bk = path.with_suffix(".bk")
-    if path.is_file():
-        path.rename(bk)
-    torch.save(obj, path)
-    bk.unlink(missing_ok=True)
-
-
-def set_seed(seed: int) -> None:
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    random.seed(seed)
-
-
-def skip_if_run_is_over(func: Callable) -> Callable:
-    def inner(*args, **kwargs):
-        path_run_is_over = Path(".run_is_over")
-        if not path_run_is_over.is_file():
-            func(*args, **kwargs)
-            path_run_is_over.touch()
-        else:
-            print(f"Run is marked as finished. To unmark, remove '{str(path_run_is_over)}'.")
-
-    return inner
-
-
-def try_until_no_except(func: Callable) -> None:
-    while True:
-        try:
-            func()
-        except KeyboardInterrupt:
-            break
-        except Exception:
-            continue
-        else:
-            break
-
-
-def wandb_log(logs: Logs, epoch: int):
-    for d in logs:
-        wandb.log({"epoch": epoch, **d})
+def resolve_output_paths(
+    args: argparse.Namespace,
+    *,
+    include_c: bool = True,
+) -> tuple[Path, Path]:
+    """Place checkpoints/logs under checkpoint_dir/<run_name>/ so runs don't overwrite."""
+    run_dir = args.checkpoint_dir / run_output_name(args, include_c=include_c)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    args.checkpoint_dir = run_dir
+    log_path = args.log_path if args.log_path is not None else (run_dir / "train_log.json")
+    return run_dir, log_path

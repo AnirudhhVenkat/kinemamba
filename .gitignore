@@ -1,26 +1,27 @@
-# Custom
-wandb
-.vscode
-outputs
-results/figures
-slurm*
-experiments
-checkpoints
-saved_runs
-dataset
-images/*
-*.png
+# Model checkpoints / weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+checkpoints/
+checkpoints_*/
+**/best.pt
+**/last.pt
 
-highway_dataset/
-highwayenv_data_processed/
-outputs/
-#*.mp4
+# Dataset / episode files
+dataset_episodes/
+*.npz
+*_visuals.npz
+*_data.csv
 
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.egg-info/
+.venv/
+venv/
 
-# Jupyter Notebook
-.ipynb_checkpoints
-
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

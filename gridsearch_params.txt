@@ -1,0 +1,2 @@
+--epochs 20 --loss-c 0.05 --pixel-mask-gain 20
+--epochs 20 --loss-c 0.05 --pixel-mask-gain 0
