@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from mask_utils import build_mask_from_fullres
-from models.cnn_encoder import CNNEncoder
+from models.encoder_decoder import Encoder, Decoder
 from models.latent_world_model import LatentWorldModel
 from models.ttc_predictor import TTCPredictor
 
@@ -67,14 +67,15 @@ class EpisodeDataset(Dataset):
 
     def __init__(
         self,
-        data_dir: Path,
-        split: str,
-        out_h: int,
-        out_w: int,
+        data_dir: Path | None = None,
+        split: str | None = None,
+        out_h: int = 48,
+        out_w: int = 320,
         interp_mode: str = "bicubic",
         max_episodes: int | None = None,
         max_frames: int | None = None,
         min_frames: int = 2,
+        paths: list[Path] | None = None,
     ):
         self.out_h = out_h
         self.out_w = out_w
@@ -84,11 +85,16 @@ class EpisodeDataset(Dataset):
         self.paths: list[Path] = []
         self.episode_lengths: list[int] = []
 
-        paths = load_visuals_paths(data_dir, split)
+        if paths is not None:
+            path_list = list(paths)
+        else:
+            if data_dir is None or split is None:
+                raise ValueError("EpisodeDataset requires either paths=... or data_dir+split")
+            path_list = load_visuals_paths(data_dir, split)
         if max_episodes is not None:
-            paths = paths[:max_episodes]
+            path_list = path_list[:max_episodes]
 
-        for path in paths:
+        for path in path_list:
             with np.load(path) as data:
                 num_frames = data["visuals"].shape[0]
             usable = num_frames
@@ -99,7 +105,8 @@ class EpisodeDataset(Dataset):
                 self.episode_lengths.append(usable)
 
         if not self.paths:
-            raise ValueError(f"No episodes with >= {min_frames} frames found for split={split!r}")
+            label = split if split is not None else "paths"
+            raise ValueError(f"No episodes with >= {min_frames} frames found for {label!r}")
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -146,26 +153,29 @@ def flatten_valid_frames(frames: torch.Tensor, lengths: torch.Tensor) -> torch.T
 
 
 def encode_episode_frames(
-    encoder: CNNEncoder,
+    encoder: Encoder,
     frames: torch.Tensor,
     lengths: torch.Tensor,
 ) -> torch.Tensor:
     """Encode each frame with the (trainable) CNN encoder -> (B, T, D)."""
-    b, t, _, _, _ = frames.shape
-    d = encoder.embed_dim * encoder.grid_h * encoder.grid_w
-    latents = torch.zeros(b, t, d, device=frames.device, dtype=torch.float32)
+    b, t, _, h, w = frames.shape
+    for _ in range(len(encoder.channels)):
+        h = h // 2
+        w = w // 2
+
+    latents = torch.zeros(b, t, h * w * encoder.channels[-1], device=frames.device, dtype=torch.float32)
     for frame_idx in range(int(lengths.max().item())):
-        z = encoder.encode_spatial(frames[:, frame_idx]).flatten(1)
+        z = encoder(frames[:, frame_idx]).flatten(1)
         latents[:, frame_idx] = z
     return latents
 
 
-def build_encoder(image_size: tuple[int, int], device: torch.device) -> CNNEncoder:
-    return CNNEncoder(image_size=image_size, input_uint8=True).to(device)
+def build_encoder(depths, channels, attn_depths, device) -> Encoder:
+    return Encoder(depths,channels,attn_depths).to(device)
 
 
 def load_encoder_checkpoint(
-    encoder: CNNEncoder,
+    encoder: Encoder,
     checkpoint_path: Path | None,
     device: torch.device,
 ) -> None:
@@ -185,7 +195,7 @@ def load_encoder_checkpoint(
 
 def load_training_checkpoint(
     checkpoint_path: Path,
-    encoder: CNNEncoder,
+    encoder: Encoder,
     world_model: LatentWorldModel,
     device: torch.device,
     ttc_predictor: TTCPredictor | None = None,
@@ -212,17 +222,22 @@ def next_step_mask(lengths: torch.Tensor, pred_steps: int, device: torch.device)
     return mask
 
 
-def pixel_weight_map(frames: torch.Tensor, gain: float) -> torch.Tensor:
-    """Per-pixel loss weights 1 + gain*mask from uint8 frames (B, T, C, H, W) -> (B, T, 1, H, W)."""
+def pixel_vehicle_mask(frames: torch.Tensor) -> torch.Tensor:
+    """Soft vehicle mask in [0, 1] from uint8 frames (B, T, C, H, W) -> (B, T, 1, H, W)."""
     b, t, c, h, w = frames.shape
     flat = frames.reshape(b * t, c, h, w).float()
     mask = build_mask_from_fullres(flat / 127.5 - 1.0, h, w)
-    return 1.0 + gain * mask.reshape(b, t, 1, h, w)
+    return mask.reshape(b, t, 1, h, w)
+
+
+def pixel_weight_map(frames: torch.Tensor, gain: float) -> torch.Tensor:
+    """Per-pixel loss weights 1 + gain*mask from uint8 frames (B, T, C, H, W) -> (B, T, 1, H, W)."""
+    return 1.0 + gain * pixel_vehicle_mask(frames)
 
 
 def save_training_checkpoint(
     path: Path,
-    encoder: CNNEncoder,
+    encoder: Encoder,
     world_model: LatentWorldModel,
     ttc_predictor: TTCPredictor,
     optimizer: torch.optim.Optimizer,

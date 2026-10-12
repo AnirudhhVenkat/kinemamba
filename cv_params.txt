@@ -1,0 +1,6 @@
+--epochs 20 --pixel-mask-gain 0 --batch-size 5
+--epochs 20 --pixel-mask-gain 10 --batch-size 5
+--epochs 20 --pixel-mask-gain 20 --batch-size 5
+--epochs 20 --pixel-mask-gain 30 --batch-size 5
+--epochs 20 --pixel-mask-gain 40 --batch-size 5
+--epochs 20 --pixel-mask-gain 50 --batch-size 5

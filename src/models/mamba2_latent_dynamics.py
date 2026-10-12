@@ -37,6 +37,7 @@ class Mamba2LatentDynamics(nn.Module):
         chunk_size: int = 64,
     ):
         super().__init__()
+        self.act = nn.ReLU()
         self.latent_dim = latent_dim #dim from CNN encoding 
         self.action_embed_dim = action_embed_dim 
         self.mamba_dim = mamba_dim # output dim D for mamba2 block
@@ -44,7 +45,7 @@ class Mamba2LatentDynamics(nn.Module):
         input_dim = latent_dim + action_embed_dim #sum action dims + cnn encoding dims
         self.action_embed = nn.Embedding(num_actions, action_embed_dim)
         self.input_norm = nn.LayerNorm(input_dim)
-        self.proj_in = nn.Linear(input_dim, mamba_dim) if mamba_dim != input_dim else nn.Identity() #encoding -> mamba_dim
+        self.proj_in = nn.Linear(input_dim, mamba_dim)  #encoding -> intermediate
         self.layer_norms = nn.ModuleList([nn.LayerNorm(mamba_dim) for _ in range(n_layers)])
         self.layers = nn.ModuleList([
             Mamba2(
@@ -60,7 +61,7 @@ class Mamba2LatentDynamics(nn.Module):
             for i in range(n_layers)
         ])
         self.norm = nn.LayerNorm(mamba_dim)
-        self.proj_out = nn.Linear(mamba_dim, latent_dim) #mamba_dim to encoding
+        self.proj_out = nn.Linear(mamba_dim, latent_dim) #intermediate to encoding
 
     def allocate_inference_cache(
         self,
@@ -102,11 +103,11 @@ class Mamba2LatentDynamics(nn.Module):
         """
         action_feats = self.action_embed(actions)
         x = torch.cat([latents, action_feats], dim=-1)
-        x = self.proj_in(self.input_norm(x)) #encdonig to mamba_dim
+        x = self.proj_in(self.input_norm(x)) #encoding to mamba_dim
         for norm, layer in zip(self.layer_norms, self.layers): #loop through all mamba2 layers
             x = x + layer(norm(x), inference_params=inference_params)
         x = self.norm(x)
-        return self.proj_out(x) #B,T,latent_dim
+        return x, self.proj_out(x) #B,T,latent_dim (linear head — targets can be negative)
 
     @torch.no_grad()
     def rollout(
@@ -145,7 +146,7 @@ class Mamba2LatentDynamics(nn.Module):
         )
 
         # Prefill: (z_0..z_{C-1}, a_0..a_{C-1}) -> preds; last is z_C.
-        prefill_out = self.forward(
+        h, prefill_out = self.forward(
             context_latents,
             actions[:, :context_steps],
             inference_params=inference_params,
@@ -154,20 +155,21 @@ class Mamba2LatentDynamics(nn.Module):
 
         z_hat = prefill_out[:, -1]
         preds = [z_hat]
-        step_outputs = [step_head(z_hat)] if step_head is not None else None
+        step_outputs = [step_head(h)] if step_head is not None else None
         if step_callback is not None:
             step_callback()
         for step in range(1, horizon):
             action_t = actions[:, context_steps + step - 1]
-            z_hat = self.forward(
+            h, z_hat = self.forward(
                 z_hat.unsqueeze(1),
                 action_t.unsqueeze(1),
                 inference_params=inference_params,
-            )[:, 0]
+            )
+            h, z_hat = h[:,0], z_hat[:,0]
             inference_params.seqlen_offset += 1
             preds.append(z_hat)
             if step_outputs is not None:
-                step_outputs.append(step_head(z_hat))
+                step_outputs.append(step_head(h))
             if step_callback is not None:
                 step_callback()
 
@@ -175,3 +177,4 @@ class Mamba2LatentDynamics(nn.Module):
             torch.stack(step_outputs, dim=1) if step_outputs is not None else None
         )
         return torch.stack(preds, dim=1), stacked_outputs  # (B, T, D)
+

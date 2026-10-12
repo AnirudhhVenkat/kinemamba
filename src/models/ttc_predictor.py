@@ -7,12 +7,16 @@ import torch.nn as nn
 
 
 class TTCPredictor(nn.Module):
-    """Predict obs_ttc from Mamba latent predictions (one TTC per predicted latent)."""
+    """MLP head: predicted CNN latent(s) -> scalar obs_ttc.
 
-    def __init__(self, latent_dim: int, hidden_dim: int = 256, dropout: float = 0.2):
+    Training uses ``forward`` on the full teacher-forced sequence ``(B, T, D)``.
+    Autoregressive rollout calls ``predict_next`` once per step with ``(B, D)``.
+    """
+
+    def __init__(self, mamba_dim: int=1024, hidden_dim: int = 256, dropout: float = 0.2):
         super().__init__()
         self.head = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
+            nn.Linear(mamba_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(p=dropout),
             nn.Linear(hidden_dim, 128),
@@ -22,11 +26,11 @@ class TTCPredictor(nn.Module):
         )
 
     def forward(self, pred_latents: torch.Tensor) -> torch.Tensor:
-        """pred_latents (B, T, D) -> TTC (B, T)."""
+        """Apply head on the last dim. ``(B, T, D) -> (B, T)`` or ``(B, D) -> (B,)``."""
         return self.head(pred_latents).squeeze(-1)
 
     def predict_next(self, pred_latents: torch.Tensor) -> torch.Tensor:
-        """Next-step TTC from final predicted latent; (B, L, D) or (B, D) -> (B,)."""
+        """TTC for one step: ``(B, D) -> (B,)``. If given ``(B, T, D)``, use the last timestep only."""
         if pred_latents.ndim == 2:
             return self.head(pred_latents).squeeze(-1)
         return self.forward(pred_latents)[:, -1]

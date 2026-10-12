@@ -1,0 +1,14 @@
+cd /Users/anivenkat/kinemamba && \
+rsync -avh --progress \
+  --exclude 'dataset_episodes/' \
+  --exclude 'checkpoints_mamba2/' \
+  ./ \
+  a.venkat@hpg.rc.ufl.edu:/blue/iruchkin/a.venkat/kinemamba/
+
+# HPG -> local (pull results; skip dataset already on laptop)
+cd /Users/anivenkat/kinemamba && \
+rsync -avh --progress \
+  --exclude 'dataset_episodes/' \
+  a.venkat@hpg.rc.ufl.edu:/blue/iruchkin/a.venkat/kinemamba/ \
+  ./
+
