@@ -9,7 +9,7 @@ encoder = Encoder()
 world_model = LatentWorldModel(latent_dim = 15360, out_h = 48, out_w = 320, mamba_dim=1024)
 ttc_predictor = TTCPredictor()
 
-models = {"Encoder": encoder, "World_Model": world_model, "TTC_Predictor": ttc_predictor}
+models = {"Encoder": encoder, "Latent_Predictor + Decoder": world_model, "TTC_Predictor": ttc_predictor}
 total = 0
 for model in models.keys():
     m = models[model]
