@@ -2,8 +2,8 @@
 """Demo: load a checkpoint and roll out test episode(s) autoregressively.
 
 Feeds `--context-steps` GT frames, then predicts `--horizon` future frames.
-All episodes share the same fixed horizon. Defaults to one episode; raise
-`--num-samples` to evaluate more.
+All episodes share the same fixed horizon. Defaults to the first eligible
+episode; raise `--num-samples` to eval/plot the first N (0 = all).
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "src" / "mamba2"))
 
-from models.cnn_encoder import normalize_image
+from models.encoder_decoder import normalize_image
 from models.latent_world_model import LatentWorldModel
 from models.ttc_predictor import TTCPredictor
 from utils import (
@@ -47,8 +47,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-dir", type=Path, default=ROOT / "dataset_episodes")
     parser.add_argument("--split", default="test")
-    parser.add_argument("--out-h", type=int, default=32)
-    parser.add_argument("--out-w", type=int, default=128)
+    parser.add_argument("--out-h", type=int, default=48)
+    parser.add_argument("--out-w", type=int, default=320)
     parser.add_argument("--interp-mode", default="bicubic")
     parser.add_argument("--context-steps", type=int, default=20, help="GT frames fed as input")
     parser.add_argument(
@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         "--num-samples",
         type=int,
         default=1,
-        help="Number of episodes to eval; 0 or negative means all eligible episodes",
+        help="First N eligible episodes to eval/plot; 0 or negative means all eligible",
     )
     parser.add_argument("--batch-size", type=int, default=1, help="Keep small for long rollouts")
     parser.add_argument("--seed", type=int, default=0)
@@ -93,41 +93,74 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_models(checkpoint_path: Path, image_size: tuple[int, int], device: torch.device):
-    encoder = build_encoder(image_size, device) #initialize from build_encoder function in train_kinemamba, which just returns a CNNEncoder object
-    latent_dim = encoder.embed_dim * encoder.grid_h * encoder.grid_w #output dimensions of the encoder
+    # Peek at the checkpoint's saved training args so the encoder / world model / TTC
+    # head match the run that was trained (including Enc/Dec pyramid depth).
+    peek_ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    train_args = peek_ckpt.get("args") or {}
+
+    depths = list(train_args.get("depths", [2, 2, 2, 2]))
+    channels = list(train_args.get("channels", [128, 192, 256, 256]))
+    attn_depths = [bool(v) for v in train_args.get("attn_depths", [0, 0, 0, 0])]
+    out_h = int(train_args.get("out_h", image_size[0]))
+    out_w = int(train_args.get("out_w", image_size[1]))
+    n_down = len(channels)
+    latent_dim = (out_h // 2**n_down) * (out_w // 2**n_down) * channels[-1]
+
+    encoder = build_encoder(depths, channels, attn_depths, device)
     world_model = LatentWorldModel(
         latent_dim=latent_dim,
-        out_h=image_size[0],
-        out_w=image_size[1],
-    ).to(device) #initialize from LatentWorldModel class in models.py
-    ttc_predictor = TTCPredictor(latent_dim=latent_dim).to(device) #initialize from TTCPredictor class in models.py
+        out_h=out_h,
+        out_w=out_w,
+        num_actions=train_args.get("num_actions", 5),
+        action_embed_dim=train_args.get("action_embed_dim", 32),
+        mamba_dim=train_args.get("mamba_dim", 1024),
+        n_layers=train_args.get("n_layers", 4),
+        d_state=train_args.get("d_state", 128),
+        expand=train_args.get("expand", 2),
+        headdim=train_args.get("headdim", 64),
+        depths=depths,
+        channels=channels,
+        attn_depths=attn_depths,
+    ).to(device)
+    ttc_predictor = TTCPredictor(
+        mamba_dim=train_args.get("mamba_dim", 1024),
+        hidden_dim=train_args.get("ttc_hidden_dim", 256),
+    ).to(device)
 
-    ckpt = load_training_checkpoint(checkpoint_path, encoder, world_model, device, ttc_predictor) #load the checkpoint from the checkpoint_path
-    train_args = ckpt.get("args") or {}
-    encoder.eval() #turn off dropout and batch normalization for evaluation
-    world_model.eval() #^^^
-    ttc_predictor.eval() #^^^
+    ckpt = load_training_checkpoint(checkpoint_path, encoder, world_model, device, ttc_predictor)
+    encoder.eval()
+    world_model.eval()
+    ttc_predictor.eval()
+    train_args = {
+        **train_args,
+        "out_h": out_h,
+        "out_w": out_w,
+        "latent_dim": latent_dim,
+        "depths": depths,
+        "channels": channels,
+        "attn_depths": attn_depths,
+    }
     return encoder, world_model, ttc_predictor, train_args
 
 
 def sample_episodes(
     dataset: EpisodeDataset,
-    num_samples: int | None, #how many episodes to sample from the validation set
+    num_samples: int | None, #how many episodes to take from the validation set
     context_steps: int,
     horizon: int,
-    seed: int,
 ) -> list[int]:
-    """Return episode indices long enough for context_steps + horizon."""
+    """Return the first episode indices long enough for context_steps + horizon.
+
+    Episodes stay in dataset order. ``num_samples <= 0`` means all eligible.
+    """
     need = context_steps + horizon
     valid = [i for i, length in enumerate(dataset.episode_lengths) if length >= need]
     if not valid:
         raise ValueError(f"No episodes with >= {need} frames")
 
-    rng = random.Random(seed)
     if num_samples is None or num_samples <= 0 or num_samples >= len(valid):
-        rng.shuffle(valid)
         return valid
-    return rng.sample(valid, num_samples)
+    return valid[:num_samples]
 
 
 def load_window_batch(
@@ -218,9 +251,9 @@ def rollout_batch(
         "n": torch.tensor(float(b), device=device),
     }
     if return_traces:
-        # Decoded frames from the first batch element, for plotting.
-        out["trace_pred_pixels"] = pred_pixels[0].cpu()
-        out["trace_target_pixels"] = target_pixels[0].cpu()
+        # Decoded frames for every batch element, for plotting.
+        out["trace_pred_pixels"] = pred_pixels.cpu()
+        out["trace_target_pixels"] = target_pixels.cpu()
     return out
 
 
@@ -379,20 +412,24 @@ def main() -> None:
     horizon = args.horizon
     min_frames = args.context_steps + horizon
 
+    encoder, world_model, ttc_predictor, train_args = load_models(
+        args.checkpoint, image_size, device
+    )
+    # Match dataset resize to the checkpoint Enc/Dec spatial size.
+    out_h = int(train_args.get("out_h", args.out_h))
+    out_w = int(train_args.get("out_w", args.out_w))
+    latent_dim = int(train_args.get("latent_dim", 0))
+
     dataset = EpisodeDataset(
         args.data_dir,
         args.split,
-        out_h=args.out_h,
-        out_w=args.out_w,
+        out_h=out_h,
+        out_w=out_w,
         interp_mode=args.interp_mode,
         min_frames=min_frames,
     )
     episodes = sample_episodes(
-        dataset, args.num_samples, args.context_steps, horizon, args.seed
-    )
-
-    encoder, world_model, ttc_predictor, train_args = load_models(
-        args.checkpoint, image_size, device
+        dataset, args.num_samples, args.context_steps, horizon
     )
 
     print(
@@ -400,7 +437,11 @@ def main() -> None:
         f"episodes={len(episodes)}  context={args.context_steps}  "
         f"horizon={horizon}"
     )
-    print(f"device={device}  batch_size={args.batch_size}")
+    print(
+        f"device={device}  batch_size={args.batch_size}  "
+        f"image_size={out_h}x{out_w}  latent_dim={latent_dim}  "
+        f"channels={train_args.get('channels')}  depths={train_args.get('depths')}"
+    )
 
     sum_pixel = 0.0
     sum_ttc = 0.0
@@ -415,7 +456,7 @@ def main() -> None:
     progress = tqdm(total=total_steps, desc="rollout steps", unit="step")
     timer = StepTimer(progress, device, args.context_steps)
     want_traces = not args.no_plot
-    traces: dict[str, torch.Tensor] | None = None
+    traces: list[tuple[int, torch.Tensor, torch.Tensor]] = []
 
     for start in range(0, len(episodes), args.batch_size):
         batch_episodes = episodes[start : start + args.batch_size]
@@ -437,16 +478,13 @@ def main() -> None:
             args.context_steps,
             horizon,
             step_callback=timer,
-            return_traces=want_traces and traces is None,
+            return_traces=want_traces,
         )
-        if want_traces and traces is None:
-            # One episode for plots: first item of the first batch.
-            traces = {
-                k[len("trace_") :]: v
-                for k, v in metrics.items()
-                if k.startswith("trace_")
-            }
-            traces["episode"] = batch_episodes[0]
+        if want_traces:
+            pred = metrics["trace_pred_pixels"]
+            target = metrics["trace_target_pixels"]
+            for i, ep in enumerate(batch_episodes):
+                traces.append((ep, pred[i], target[i]))
 
         n = metrics["n"].item()
         sum_n += n
@@ -528,21 +566,20 @@ def main() -> None:
             )
         print(f"throughput                    = {timing['steps_per_s']:.1f} steps/s")
 
-    if traces is not None:
+    if traces:
         plot_dir = args.plot_dir or (args.checkpoint.parent / "rollout_plots")
-        episode_name = dataset.paths[traces["episode"]].stem
-        pred_pixels = traces["pred_pixels"]
-        target_pixels = traces["target_pixels"]
-
-        horizon_len = pred_pixels.shape[0]
-        print(f"\n=== plots ({episode_name}) ===")
-        mosaic_path = plot_dir / f"{episode_name}_pred_all_frames.png"
-        save_frame_mosaic(pred_pixels, mosaic_path, args.mosaic_cols)
-        print(f"all {horizon_len} predicted frames -> {mosaic_path}")
-
-        compare_path = plot_dir / f"{episode_name}_pred_vs_gt_all_frames.png"
-        save_comparison_mosaic(pred_pixels, target_pixels, compare_path)
-        print(f"pred row over GT row ({horizon_len} steps) -> {compare_path}")
+        print(f"\n=== plots ({len(traces)} episodes) -> {plot_dir} ===")
+        for ep, pred_pixels, target_pixels in traces:
+            episode_name = dataset.paths[ep].stem
+            horizon_len = pred_pixels.shape[0]
+            mosaic_path = plot_dir / f"{episode_name}_pred_all_frames.png"
+            save_frame_mosaic(pred_pixels, mosaic_path, args.mosaic_cols)
+            compare_path = plot_dir / f"{episode_name}_pred_vs_gt_all_frames.png"
+            save_comparison_mosaic(pred_pixels, target_pixels, compare_path)
+            print(
+                f"{episode_name}: {horizon_len} frames -> "
+                f"{mosaic_path.name}, {compare_path.name}"
+            )
 
     out_json = args.out_json
     if out_json is None:

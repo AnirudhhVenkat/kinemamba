@@ -1,0 +1,10 @@
+--epochs 20 --pixel-mask-gain 40 --batch-size 2 --loss-a 1 --loss-b 1 --loss-c 1
+--epochs 20 --pixel-mask-gain 40 --batch-size 2 --loss-a 1 --loss-b 1 --loss-c 2
+--epochs 20 --pixel-mask-gain 40 --batch-size 2 --loss-a 1 --loss-b 1 --loss-c 3
+--epochs 20 --pixel-mask-gain 40 --batch-size 2 --loss-a 1 --loss-b 1 --loss-c 4
+--epochs 20 --pixel-mask-gain 40 --batch-size 2 --loss-a 1 --loss-b 1 --loss-c 5
+--epochs 20 --pixel-mask-gain 40 --batch-size 2 --loss-a 1 --loss-b 1 --loss-c 6
+--epochs 20 --pixel-mask-gain 40 --batch-size 2 --loss-a 1 --loss-b 1 --loss-c 7
+--epochs 20 --pixel-mask-gain 40 --batch-size 2 --loss-a 1 --loss-b 1 --loss-c 8
+--epochs 20 --pixel-mask-gain 40 --batch-size 2 --loss-a 1 --loss-b 1 --loss-c 9
+--epochs 20 --pixel-mask-gain 40 --batch-size 2 --loss-a 1 --loss-b 1 --loss-c 10

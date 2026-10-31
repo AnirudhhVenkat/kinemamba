@@ -93,7 +93,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.layer_idx = layer_idx #for inference caching 
 
         # Order: [z, x, B, C, dt]
-        d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
+        d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads # (2*2*512) + (2*1*128) + (2*512/64) 
         if self.process_group is None:
             self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=bias, **factory_kwargs)
         else:
@@ -101,7 +101,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                                                 process_group=self.process_group, sequence_parallel=self.sequence_parallel,
                                                 **factory_kwargs)
 
-        conv_dim = self.d_ssm + 2 * self.ngroups * self.d_state
+        conv_dim = self.d_ssm + 2 * self.ngroups * self.d_state # (2*512 + 2*1*128)
         self.conv1d = nn.Conv1d(
             in_channels=conv_dim,
             out_channels=conv_dim,

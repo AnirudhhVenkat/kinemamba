@@ -1,17 +1,16 @@
-"""Kinemamba model architectures: JEPA CNN encoder, world model, and TTC predictor."""
+"""Kinemamba model architectures: CNN encoder, world model, and TTC predictor."""
 
-from .cnn_encoder import CNNEncoder, RMSNorm2d, normalize_image
+from .encoder_decoder import Decoder, Encoder, normalize_image, GroupNorm
 from .latent_world_model import LatentWorldModel
-from .linear_pixel_decoder import LinearPixelDecoder
 from .mamba2_latent_dynamics import Mamba2LatentDynamics
 from .ttc_predictor import TTCPredictor
 
 __all__ = [
-    "CNNEncoder",
+    "Encoder",
     "LatentWorldModel",
-    "LinearPixelDecoder",
+    "Decoder",
     "Mamba2LatentDynamics",
-    "RMSNorm2d",
     "TTCPredictor",
+    "GroupNorm",
     "normalize_image",
 ]
